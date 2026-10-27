@@ -1,11 +1,10 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
-  salesData,
-  uniqueYears,
-  uniqueMonths,
-  uniqueDays,
-  monthNames,
-} from './data/salesData';
+  loadFromGoogleSheets,
+  parseFileContent,
+  SPREADSHEET_ID,
+  type SaleRecord,
+} from './data/googleSheetsLoader';
 import {
   BarChart3,
   Receipt,
@@ -14,6 +13,12 @@ import {
   Filter,
   Calendar,
   PieChart as PieChartIcon,
+  RefreshCw,
+  Upload,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
+  ExternalLink,
 } from 'lucide-react';
 
 const COLORS = [
@@ -22,11 +27,85 @@ const COLORS = [
   '#22c55e', '#14b8a6', '#06b6d4', '#3b82f6',
 ];
 
+type LoadingState = 'idle' | 'loading' | 'success' | 'error';
+
 export default function App() {
+  const [salesData, setSalesData] = useState<SaleRecord[]>([]);
+  const [loadingState, setLoadingState] = useState<LoadingState>('idle');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selectedYear, setSelectedYear] = useState<number | 'all'>('all');
   const [selectedMonth, setSelectedMonth] = useState<number | 'all'>('all');
   const [selectedDay, setSelectedDay] = useState<number | 'all'>('all');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Загрузка данных из Google Sheets
+  const loadData = useCallback(async () => {
+    setLoadingState('loading');
+    setErrorMessage('');
+    try {
+      const records = await loadFromGoogleSheets();
+      setSalesData(records);
+      setLoadingState('success');
+      setLastUpdated(new Date());
+      // Сбрасываем фильтры
+      setSelectedYear('all');
+      setSelectedMonth('all');
+      setSelectedDay('all');
+    } catch (err) {
+      setLoadingState('error');
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Не удалось загрузить данные. Убедитесь, что таблица опубликована для доступа по ссылке.'
+      );
+    }
+  }, []);
+
+  // Автозагрузка при монтировании
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  // Автообновление каждые 5 минут
+  useEffect(() => {
+    if (loadingState !== 'success') return;
+    const interval = setInterval(() => {
+      loadData();
+    }, 5 * 60 * 1000); // 5 минут
+    return () => clearInterval(interval);
+  }, [loadingState, loadData]);
+
+  // Загрузка из файла
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      try {
+        const records = parseFileContent(content);
+        if (records.length === 0) {
+          setErrorMessage('Не удалось распарсить данные из файла');
+          setLoadingState('error');
+          return;
+        }
+        setSalesData(records);
+        setLoadingState('success');
+        setLastUpdated(new Date());
+        setSelectedYear('all');
+        setSelectedMonth('all');
+        setSelectedDay('all');
+      } catch {
+        setErrorMessage('Ошибка при чтении файла');
+        setLoadingState('error');
+      }
+    };
+    reader.readAsText(file, 'UTF-8');
+  };
+
+  // Фильтрация данных
   const filteredData = useMemo(() => {
     return salesData.filter((record) => {
       if (selectedYear !== 'all' && record.год !== selectedYear) return false;
@@ -34,34 +113,65 @@ export default function App() {
       if (selectedDay !== 'all' && record.День !== selectedDay) return false;
       return true;
     });
-  }, [selectedYear, selectedMonth, selectedDay]);
+  }, [salesData, selectedYear, selectedMonth, selectedDay]);
 
+  // Уникальные значения для фильтров
+  const uniqueYears = useMemo(() => [...new Set(salesData.map((r) => r.год))].filter(Boolean).sort(), [salesData]);
+  const uniqueMonths = useMemo(() => {
+    const months = new Set<number>();
+    salesData.forEach((r) => {
+      if (selectedYear === 'all' || r.год === selectedYear) {
+        if (r.месяц) months.add(r.месяц);
+      }
+    });
+    return [...months].sort((a, b) => a - b);
+  }, [salesData, selectedYear]);
+  const uniqueDays = useMemo(() => {
+    const days = new Set<number>();
+    salesData.forEach((r) => {
+      if (selectedYear === 'all' || r.год === selectedYear) {
+        if (selectedMonth === 'all' || r.месяц === selectedMonth) {
+          if (r.День) days.add(r.День);
+        }
+      }
+    });
+    return [...days].sort((a, b) => a - b);
+  }, [salesData, selectedYear, selectedMonth]);
+
+  const monthNames = [
+    'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+  ];
+
+  // Метрики
   const metrics = useMemo(() => {
-    const uniqueChecks = new Set(filteredData.map((r) => r.Чек)).size;
+    const uniqueChecks = new Set(filteredData.map((r) => r.Чек).filter(Boolean)).size;
     const totalSum = filteredData.reduce((acc, r) => acc + r.Суммаруч, 0);
     const avgCheck = uniqueChecks > 0 ? totalSum / uniqueChecks : 0;
     const avgItemsPerCheck = uniqueChecks > 0 ? filteredData.length / uniqueChecks : 0;
-
     return { uniqueChecks, totalSum, avgCheck, avgItemsPerCheck };
   }, [filteredData]);
 
+  // Доля по видам товаров
   const groupData = useMemo(() => {
     const grouped: Record<string, number> = {};
     filteredData.forEach((r) => {
-      grouped[r.Группа] = (grouped[r.Группа] || 0) + r.Суммаруч;
+      if (r.Группа) grouped[r.Группа] = (grouped[r.Группа] || 0) + r.Суммаруч;
     });
     return Object.entries(grouped)
       .map(([name, value]) => ({ name, value }))
       .sort((a, b) => b.value - a.value);
   }, [filteredData]);
 
+  // Динамика по месяцам
   const monthlyData = useMemo(() => {
     const grouped: Record<string, { sum: number; checks: Set<string> }> = {};
     filteredData.forEach((r) => {
+      if (!r.год || !r.месяц) return;
       const key = `${r.год}-${String(r.месяц).padStart(2, '0')}`;
       if (!grouped[key]) grouped[key] = { sum: 0, checks: new Set() };
       grouped[key].sum += r.Суммаруч;
-      grouped[key].checks.add(r.Чек);
+      if (r.Чек) grouped[key].checks.add(r.Чек);
     });
     return Object.entries(grouped)
       .map(([month, data]) => ({
@@ -72,13 +182,15 @@ export default function App() {
       .sort((a, b) => a.month.localeCompare(b.month));
   }, [filteredData]);
 
+  // Динамика по дням
   const dailyData = useMemo(() => {
     if (selectedYear === 'all' || selectedMonth === 'all') return [];
     const grouped: Record<number, { sum: number; checks: Set<string> }> = {};
     filteredData.forEach((r) => {
+      if (!r.День) return;
       if (!grouped[r.День]) grouped[r.День] = { sum: 0, checks: new Set() };
       grouped[r.День].sum += r.Суммаруч;
-      grouped[r.День].checks.add(r.Чек);
+      if (r.Чек) grouped[r.День].checks.add(r.Чек);
     });
     return Object.entries(grouped)
       .map(([day, data]) => ({
@@ -89,9 +201,11 @@ export default function App() {
       .sort((a, b) => a.day - b.day);
   }, [filteredData, selectedYear, selectedMonth]);
 
+  // Топ товаров
   const topItems = useMemo(() => {
     const grouped: Record<string, { qty: number; sum: number }> = {};
     filteredData.forEach((r) => {
+      if (!r.Номенклатура) return;
       if (!grouped[r.Номенклатура]) grouped[r.Номенклатура] = { qty: 0, sum: 0 };
       grouped[r.Номенклатура].qty += r.Количество;
       grouped[r.Номенклатура].sum += r.Суммаруч;
@@ -104,34 +218,158 @@ export default function App() {
 
   const formatCurrency = (val: number) =>
     new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 0 }).format(val);
-
   const formatNumber = (val: number) =>
     new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 }).format(val);
 
   const totalGroupSum = groupData.reduce((acc, g) => acc + g.value, 0);
 
+  // Экран загрузки / ошибки
+  if (loadingState === 'loading' && salesData.length === 0) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-900 flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <Loader2 className="w-12 h-12 text-indigo-400 animate-spin mx-auto" />
+          <h2 className="text-xl font-bold text-white">Загрузка данных из Google Sheets...</h2>
+          <p className="text-sm text-slate-400 max-w-md">
+            Подключение к таблице{' '}
+            <a
+              href={`https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit?gid=358257747#gid=358257747`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-indigo-400 hover:underline inline-flex items-center gap-1"
+            >
+              открыть <ExternalLink className="w-3 h-3" />
+            </a>
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadingState === 'error' && salesData.length === 0) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-900 flex items-center justify-center p-4">
+        <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-8 max-w-lg w-full space-y-5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-red-500/20 flex items-center justify-center">
+              <AlertCircle className="w-5 h-5 text-red-400" />
+            </div>
+            <h2 className="text-lg font-bold text-white">Не удалось загрузить данные</h2>
+          </div>
+          <p className="text-sm text-slate-400">{errorMessage}</p>
+          <div className="bg-slate-800/50 rounded-xl p-4 space-y-3">
+            <p className="text-sm text-slate-300 font-medium">Чтобы загрузить данные:</p>
+            <ol className="text-xs text-slate-400 space-y-2 list-decimal list-inside">
+              <li>
+                Откройте таблицу{' '}
+                <a
+                  href={`https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit?gid=358257747#gid=358257747`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-indigo-400 hover:underline"
+                >
+                  в Google Sheets
+                </a>
+              </li>
+              <li>Нажмите «Файл» → «Поделиться» → «Опубликовать в интернете»</li>
+              <li>Или: «Настроить доступ» → «Все у кого есть ссылка» → «Читатель»</li>
+              <li>Нажмите «Попробовать снова» ниже</li>
+            </ol>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <button
+              onClick={loadData}
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-sm text-white font-medium transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Попробовать снова
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 rounded-xl text-sm text-slate-300 transition-colors"
+            >
+              <Upload className="w-4 h-4" />
+              Загрузить CSV
+            </button>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,.txt"
+            onChange={handleFileUpload}
+            className="hidden"
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-900">
       {/* Header */}
       <header className="border-b border-white/10 bg-white/5 backdrop-blur-xl">
-        <div className="max-w-[1600px] mx-auto px-4 py-4 flex items-center justify-between">
+        <div className="max-w-[1600px] mx-auto px-4 py-4 flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
               <BarChart3 className="w-5 h-5 text-white" />
             </div>
             <div>
               <h1 className="text-xl font-bold text-white">Дашборд продаж</h1>
-              <p className="text-xs text-slate-400">Аналитика в реальном времени</p>
+              <p className="text-xs text-slate-400">
+                Данные из{' '}
+                <a
+                  href={`https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit?gid=358257747#gid=358257747`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-indigo-400 hover:underline inline-flex items-center gap-1"
+                >
+                  Google Sheets <ExternalLink className="w-3 h-3" />
+                </a>
+              </p>
             </div>
           </div>
-          <div className="flex items-center gap-2 text-sm text-slate-400">
-            <Calendar className="w-4 h-4" />
-            <span>Данные: {salesData.length.toLocaleString('ru-RU')} записей</span>
+          <div className="flex items-center gap-3">
+            {lastUpdated && (
+              <span className="text-xs text-slate-500 flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                Обновлено: {lastUpdated.toLocaleTimeString('ru-RU')}
+              </span>
+            )}
+            <button
+              onClick={loadData}
+              disabled={loadingState === 'loading'}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/30 rounded-lg text-xs text-indigo-300 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${loadingState === 'loading' ? 'animate-spin' : ''}`} />
+              Обновить
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 rounded-lg text-xs text-slate-300 transition-colors"
+            >
+              <Upload className="w-3 h-3" />
+              CSV
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.txt"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
           </div>
         </div>
       </header>
 
       <main className="max-w-[1600px] mx-auto px-4 py-6 space-y-6">
+        {/* Статус обновления */}
+        {loadingState === 'loading' && salesData.length > 0 && (
+          <div className="bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-4 py-2 flex items-center gap-2 text-sm text-indigo-300">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Обновление данных...
+          </div>
+        )}
+
         {/* Фильтры */}
         <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-4">
           <div className="flex items-center gap-2 mb-3">
@@ -139,7 +377,7 @@ export default function App() {
             <span className="text-sm font-medium text-slate-300">Фильтры</span>
           </div>
           <div className="flex flex-wrap gap-4">
-            <div className="flex-1 min-w-[180px]">
+            <div className="flex-1 min-w-[160px]">
               <label className="text-xs text-slate-400 mb-1 block">Год</label>
               <select
                 value={selectedYear === 'all' ? 'all' : selectedYear}
@@ -157,7 +395,7 @@ export default function App() {
                 ))}
               </select>
             </div>
-            <div className="flex-1 min-w-[180px]">
+            <div className="flex-1 min-w-[160px]">
               <label className="text-xs text-slate-400 mb-1 block">Месяц</label>
               <select
                 value={selectedMonth === 'all' ? 'all' : selectedMonth}
@@ -167,7 +405,7 @@ export default function App() {
                   setSelectedDay('all');
                 }}
                 className="w-full bg-slate-800/80 border border-slate-600/50 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                disabled={selectedYear === 'all'}
+                disabled={uniqueYears.length === 0}
               >
                 <option value="all">Все месяцы</option>
                 {uniqueMonths.map((m) => (
@@ -175,7 +413,7 @@ export default function App() {
                 ))}
               </select>
             </div>
-            <div className="flex-1 min-w-[180px]">
+            <div className="flex-1 min-w-[160px]">
               <label className="text-xs text-slate-400 mb-1 block">День</label>
               <select
                 value={selectedDay === 'all' ? 'all' : selectedDay}
@@ -184,7 +422,7 @@ export default function App() {
                   setSelectedDay(val === 'all' ? 'all' : parseInt(val));
                 }}
                 className="w-full bg-slate-800/80 border border-slate-600/50 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                disabled={selectedMonth === 'all'}
+                disabled={uniqueMonths.length === 0}
               >
                 <option value="all">Все дни</option>
                 {uniqueDays.map((d) => (
@@ -239,37 +477,45 @@ export default function App() {
 
         {/* Графики */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Доля по видам товаров - Donut Chart */}
           <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-5">
             <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
               <PieChartIcon className="w-4 h-4 text-purple-400" />
               Доля по видам товаров
             </h3>
-            <DonutChart data={groupData} total={totalGroupSum} />
+            {groupData.length > 0 ? (
+              <DonutChart data={groupData} total={totalGroupSum} />
+            ) : (
+              <EmptyState text="Нет данных для отображения" />
+            )}
           </div>
 
-          {/* Доля по видам товаров - Horizontal Bar Chart */}
           <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-5">
             <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
               <BarChart3 className="w-4 h-4 text-indigo-400" />
               Выручка по группам товаров
             </h3>
-            <HorizontalBarChart data={groupData} />
+            {groupData.length > 0 ? (
+              <HorizontalBarChart data={groupData} />
+            ) : (
+              <EmptyState text="Нет данных для отображения" />
+            )}
           </div>
         </div>
 
         {/* Динамика */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Динамика по месяцам */}
           <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-5">
             <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
               <TrendingUp className="w-4 h-4 text-emerald-400" />
               Динамика выручки по месяцам
             </h3>
-            <LineChartSVG data={monthlyData} />
+            {monthlyData.length > 0 ? (
+              <LineChartSVG data={monthlyData} />
+            ) : (
+              <EmptyState text="Нет данных для отображения" />
+            )}
           </div>
 
-          {/* Динамика по дням */}
           <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-5">
             <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
               <Calendar className="w-4 h-4 text-amber-400" />
@@ -278,9 +524,7 @@ export default function App() {
             {dailyData.length > 0 ? (
               <BarChartSVG data={dailyData} />
             ) : (
-              <div className="h-[300px] flex items-center justify-center text-slate-500 text-sm">
-                Выберите год и месяц для отображения динамики по дням
-              </div>
+              <EmptyState text="Выберите год и месяц для отображения" />
             )}
           </div>
         </div>
@@ -291,7 +535,11 @@ export default function App() {
             <ShoppingCart className="w-4 h-4 text-pink-400" />
             Топ-10 товаров по выручке
           </h3>
-          <HorizontalBarChart data={topItems.map((item) => ({ name: item.name, value: item.sum }))} />
+          {topItems.length > 0 ? (
+            <HorizontalBarChart data={topItems.map((item) => ({ name: item.name, value: item.sum }))} />
+          ) : (
+            <EmptyState text="Нет данных для отображения" />
+          )}
         </div>
 
         {/* Таблица по группам */}
@@ -300,58 +548,62 @@ export default function App() {
             <BarChart3 className="w-4 h-4 text-cyan-400" />
             Детализация по группам товаров
           </h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-white/10">
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">Группа</th>
-                  <th className="text-right py-3 px-4 text-slate-400 font-medium">Выручка</th>
-                  <th className="text-right py-3 px-4 text-slate-400 font-medium">Доля</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium w-1/3">Визуализация</th>
-                </tr>
-              </thead>
-              <tbody>
-                {groupData.map((item, index) => {
-                  const share = totalGroupSum > 0 ? (item.value / totalGroupSum) * 100 : 0;
-                  return (
-                    <tr key={item.name} className="border-b border-white/5 hover:bg-white/5 transition-colors">
-                      <td className="py-3 px-4 text-white">
-                        <div className="flex items-center gap-2">
-                          <span
-                            className="w-3 h-3 rounded-full inline-block flex-shrink-0"
-                            style={{ backgroundColor: COLORS[index % COLORS.length] }}
-                          />
-                          {item.name}
-                        </div>
-                      </td>
-                      <td className="py-3 px-4 text-right text-white font-mono">
-                        {formatCurrency(item.value)}
-                      </td>
-                      <td className="py-3 px-4 text-right text-slate-300">
-                        {share.toFixed(1)}%
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="w-full bg-slate-700/50 rounded-full h-2">
-                          <div
-                            className="h-2 rounded-full transition-all duration-500"
-                            style={{
-                              width: `${share}%`,
-                              backgroundColor: COLORS[index % COLORS.length],
-                            }}
-                          />
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          {groupData.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-white/10">
+                    <th className="text-left py-3 px-4 text-slate-400 font-medium">Группа</th>
+                    <th className="text-right py-3 px-4 text-slate-400 font-medium">Выручка</th>
+                    <th className="text-right py-3 px-4 text-slate-400 font-medium">Доля</th>
+                    <th className="text-left py-3 px-4 text-slate-400 font-medium w-1/3">Визуализация</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {groupData.map((item, index) => {
+                    const share = totalGroupSum > 0 ? (item.value / totalGroupSum) * 100 : 0;
+                    return (
+                      <tr key={item.name} className="border-b border-white/5 hover:bg-white/5 transition-colors">
+                        <td className="py-3 px-4 text-white">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="w-3 h-3 rounded-full inline-block flex-shrink-0"
+                              style={{ backgroundColor: COLORS[index % COLORS.length] }}
+                            />
+                            {item.name}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 text-right text-white font-mono">
+                          {formatCurrency(item.value)}
+                        </td>
+                        <td className="py-3 px-4 text-right text-slate-300">
+                          {share.toFixed(1)}%
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="w-full bg-slate-700/50 rounded-full h-2">
+                            <div
+                              className="h-2 rounded-full transition-all duration-500"
+                              style={{
+                                width: `${share}%`,
+                                backgroundColor: COLORS[index % COLORS.length],
+                              }}
+                            />
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState text="Нет данных для отображения" />
+          )}
         </div>
 
         {/* Footer */}
         <footer className="text-center py-4 text-xs text-slate-500">
-          Дашборд продаж • Данные обновляются автоматически • {new Date().toLocaleDateString('ru-RU')}
+          Дашборд продаж • Автообновление каждые 5 минут • {new Date().toLocaleDateString('ru-RU')}
         </footer>
       </main>
     </div>
@@ -369,7 +621,6 @@ function DonutChart({ data, total }: { data: { name: string; value: number }[]; 
   const innerR = 65;
 
   let cumulativeAngle = -Math.PI / 2;
-
   const slices = data.map((item, index) => {
     const fraction = total > 0 ? item.value / total : 0;
     const angle = fraction * 2 * Math.PI;
@@ -385,7 +636,6 @@ function DonutChart({ data, total }: { data: { name: string; value: number }[]; 
     const y3 = cy + innerR * Math.sin(endAngle);
     const x4 = cx + innerR * Math.cos(startAngle);
     const y4 = cy + innerR * Math.sin(startAngle);
-
     const largeArc = angle > Math.PI ? 1 : 0;
 
     const d = [
@@ -416,14 +666,11 @@ function DonutChart({ data, total }: { data: { name: string; value: number }[]; 
             className="cursor-pointer transition-opacity duration-200"
           />
         ))}
-        <text x={cx} y={cy - 8} textAnchor="middle" fill="#94a3b8" fontSize="11">
-          Итого
-        </text>
+        <text x={cx} y={cy - 8} textAnchor="middle" fill="#94a3b8" fontSize="11">Итого</text>
         <text x={cx} y={cy + 12} textAnchor="middle" fill="#fff" fontSize="13" fontWeight="bold">
           {formatCurrency(total)}
         </text>
       </svg>
-      {/* Legend */}
       <div className="flex flex-wrap gap-2 mt-3 justify-center max-w-[350px]">
         {data.map((item, index) => (
           <div
@@ -465,39 +712,13 @@ function HorizontalBarChart({ data }: { data: { name: string; value: number }[] 
           const width = (item.value / maxVal) * barAreaWidth;
           const color = COLORS[index % COLORS.length];
           const isHovered = hoveredIndex === index;
-
           return (
-            <g
-              key={item.name}
-              onMouseEnter={() => setHoveredIndex(index)}
-              onMouseLeave={() => setHoveredIndex(null)}
-              className="cursor-pointer"
-            >
-              <text
-                x={labelWidth - 8}
-                y={y + barHeight / 2 + 4}
-                textAnchor="end"
-                fill={isHovered ? '#fff' : '#94a3b8'}
-                fontSize="11"
-              >
+            <g key={item.name} onMouseEnter={() => setHoveredIndex(index)} onMouseLeave={() => setHoveredIndex(null)} className="cursor-pointer">
+              <text x={labelWidth - 8} y={y + barHeight / 2 + 4} textAnchor="end" fill={isHovered ? '#fff' : '#94a3b8'} fontSize="11">
                 {item.name.length > 18 ? item.name.slice(0, 18) + '…' : item.name}
               </text>
-              <rect
-                x={labelWidth}
-                y={y}
-                width={width}
-                height={barHeight}
-                rx={4}
-                fill={color}
-                opacity={isHovered ? 1 : 0.8}
-                className="transition-all duration-200"
-              />
-              <text
-                x={labelWidth + width + 6}
-                y={y + barHeight / 2 + 4}
-                fill={isHovered ? '#fff' : '#94a3b8'}
-                fontSize="10"
-              >
+              <rect x={labelWidth} y={y} width={width} height={barHeight} rx={4} fill={color} opacity={isHovered ? 1 : 0.8} className="transition-all duration-200" />
+              <text x={labelWidth + width + 6} y={y + barHeight / 2 + 4} fill={isHovered ? '#fff' : '#94a3b8'} fontSize="10">
                 {formatCurrency(item.value)}
               </text>
             </g>
@@ -510,16 +731,13 @@ function HorizontalBarChart({ data }: { data: { name: string; value: number }[] 
 
 function LineChartSVG({ data }: { data: { month: string; выручка: number; чеки: number }[] }) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  if (data.length === 0) {
-    return <div className="h-[300px] flex items-center justify-center text-slate-500 text-sm">Нет данных</div>;
-  }
+  if (data.length === 0) return null;
 
   const width = 500;
   const height = 280;
   const padding = { top: 20, right: 20, bottom: 60, left: 60 };
   const chartW = width - padding.left - padding.right;
   const chartH = height - padding.top - padding.bottom;
-
   const maxVal = Math.max(...data.map((d) => d.выручка), 1);
   const stepX = data.length > 1 ? chartW / (data.length - 1) : chartW;
 
@@ -535,7 +753,6 @@ function LineChartSVG({ data }: { data: { month: string; выручка: number;
   const formatCurrency = (val: number) =>
     new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', maximumFractionDigits: 0 }).format(val);
 
-  // Y-axis ticks
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map((t) => ({
     y: padding.top + chartH - t * chartH,
     label: `${((maxVal * t) / 1000000).toFixed(1)}М`,
@@ -544,72 +761,33 @@ function LineChartSVG({ data }: { data: { month: string; выручка: number;
   return (
     <div className="overflow-x-auto">
       <svg width="100%" viewBox={`0 0 ${width} ${height}`} className="min-w-[400px]">
-        {/* Grid lines */}
         {yTicks.map((tick, i) => (
           <g key={i}>
             <line x1={padding.left} y1={tick.y} x2={width - padding.right} y2={tick.y} stroke="rgba(255,255,255,0.05)" />
             <text x={padding.left - 8} y={tick.y + 4} textAnchor="end" fill="#64748b" fontSize="10">{tick.label}</text>
           </g>
         ))}
-
-        {/* Area */}
         <path d={areaPath} fill="url(#lineGradient)" opacity={0.3} />
-
-        {/* Line */}
         <path d={linePath} fill="none" stroke="#6366f1" strokeWidth={2.5} strokeLinejoin="round" />
-
-        {/* Points */}
         {points.map((p, i) => (
           <g key={i} onMouseEnter={() => setHoveredIndex(i)} onMouseLeave={() => setHoveredIndex(null)} className="cursor-pointer">
             <circle cx={p.x} cy={p.y} r={hoveredIndex === i ? 5 : 3} fill="#6366f1" stroke="#1e1b4b" strokeWidth={2} />
-            {/* X labels */}
-            <text
-              x={p.x}
-              y={padding.top + chartH + 16}
-              textAnchor="end"
-              fill="#64748b"
-              fontSize="9"
-              transform={`rotate(-30, ${p.x}, ${padding.top + chartH + 16})`}
-            >
+            <text x={p.x} y={padding.top + chartH + 16} textAnchor="end" fill="#64748b" fontSize="9" transform={`rotate(-30, ${p.x}, ${padding.top + chartH + 16})`}>
               {p.month}
             </text>
-            {/* Tooltip */}
             {hoveredIndex === i && (
               <g>
-                <rect
-                  x={Math.min(p.x - 60, width - padding.right - 130)}
-                  y={Math.max(p.y - 50, padding.top)}
-                  width={120}
-                  height={40}
-                  rx={6}
-                  fill="#1e293b"
-                  stroke="rgba(255,255,255,0.1)"
-                />
-                <text
-                  x={Math.min(p.x, width - padding.right - 70)}
-                  y={Math.max(p.y - 32, padding.top + 18)}
-                  textAnchor="middle"
-                  fill="#fff"
-                  fontSize="10"
-                  fontWeight="bold"
-                >
+                <rect x={Math.min(p.x - 60, width - padding.right - 130)} y={Math.max(p.y - 50, padding.top)} width={120} height={40} rx={6} fill="#1e293b" stroke="rgba(255,255,255,0.1)" />
+                <text x={Math.min(p.x, width - padding.right - 70)} y={Math.max(p.y - 32, padding.top + 18)} textAnchor="middle" fill="#fff" fontSize="10" fontWeight="bold">
                   {formatCurrency(p.выручка)}
                 </text>
-                <text
-                  x={Math.min(p.x, width - padding.right - 70)}
-                  y={Math.max(p.y - 18, padding.top + 32)}
-                  textAnchor="middle"
-                  fill="#94a3b8"
-                  fontSize="9"
-                >
+                <text x={Math.min(p.x, width - padding.right - 70)} y={Math.max(p.y - 18, padding.top + 32)} textAnchor="middle" fill="#94a3b8" fontSize="9">
                   Чеков: {p.чеки}
                 </text>
               </g>
             )}
           </g>
         ))}
-
-        {/* Gradient */}
         <defs>
           <linearGradient id="lineGradient" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#6366f1" />
@@ -630,7 +808,6 @@ function BarChartSVG({ data }: { data: { day: number; выручка: number; ч
   const padding = { top: 20, right: 20, bottom: 40, left: 60 };
   const chartW = width - padding.left - padding.right;
   const chartH = height - padding.top - padding.bottom;
-
   const maxVal = Math.max(...data.map((d) => d.выручка), 1);
   const barWidth = Math.max((chartW / data.length) * 0.7, 4);
   const gap = (chartW / data.length) * 0.3;
@@ -646,54 +823,28 @@ function BarChartSVG({ data }: { data: { day: number; выручка: number; ч
   return (
     <div className="overflow-x-auto">
       <svg width="100%" viewBox={`0 0 ${width} ${height}`} className="min-w-[400px]">
-        {/* Grid */}
         {yTicks.map((tick, i) => (
           <g key={i}>
             <line x1={padding.left} y1={tick.y} x2={width - padding.right} y2={tick.y} stroke="rgba(255,255,255,0.05)" />
             <text x={padding.left - 8} y={tick.y + 4} textAnchor="end" fill="#64748b" fontSize="10">{tick.label}</text>
           </g>
         ))}
-
-        {/* Bars */}
         {data.map((d, i) => {
           const x = padding.left + i * (barWidth + gap) + gap / 2;
           const barH = (d.выручка / maxVal) * chartH;
           const y = padding.top + chartH - barH;
           const isHovered = hoveredIndex === i;
-
           return (
-            <g
-              key={d.day}
-              onMouseEnter={() => setHoveredIndex(i)}
-              onMouseLeave={() => setHoveredIndex(null)}
-              className="cursor-pointer"
-            >
-              <rect
-                x={x}
-                y={y}
-                width={barWidth}
-                height={barH}
-                rx={2}
-                fill={isHovered ? '#fbbf24' : '#f59e0b'}
-                opacity={isHovered ? 1 : 0.8}
-                className="transition-all duration-150"
-              />
-              {/* X label */}
+            <g key={d.day} onMouseEnter={() => setHoveredIndex(i)} onMouseLeave={() => setHoveredIndex(null)} className="cursor-pointer">
+              <rect x={x} y={y} width={barWidth} height={barH} rx={2} fill={isHovered ? '#fbbf24' : '#f59e0b'} opacity={isHovered ? 1 : 0.8} className="transition-all duration-150" />
               {data.length <= 15 || i % 2 === 0 ? (
-                <text x={x + barWidth / 2} y={padding.top + chartH + 16} textAnchor="middle" fill="#64748b" fontSize="10">
-                  {d.day}
-                </text>
+                <text x={x + barWidth / 2} y={padding.top + chartH + 16} textAnchor="middle" fill="#64748b" fontSize="10">{d.day}</text>
               ) : null}
-              {/* Tooltip */}
               {isHovered && (
                 <g>
                   <rect x={x - 40} y={Math.max(y - 45, padding.top)} width={100} height={38} rx={6} fill="#1e293b" stroke="rgba(255,255,255,0.1)" />
-                  <text x={x + 10} y={Math.max(y - 28, padding.top + 17)} textAnchor="middle" fill="#fff" fontSize="10" fontWeight="bold">
-                    {formatCurrency(d.выручка)}
-                  </text>
-                  <text x={x + 10} y={Math.max(y - 14, padding.top + 31)} textAnchor="middle" fill="#94a3b8" fontSize="9">
-                    Чеков: {d.чеки}
-                  </text>
+                  <text x={x + 10} y={Math.max(y - 28, padding.top + 17)} textAnchor="middle" fill="#fff" fontSize="10" fontWeight="bold">{formatCurrency(d.выручка)}</text>
+                  <text x={x + 10} y={Math.max(y - 14, padding.top + 31)} textAnchor="middle" fill="#94a3b8" fontSize="9">Чеков: {d.чеки}</text>
                 </g>
               )}
             </g>
@@ -706,33 +857,23 @@ function BarChartSVG({ data }: { data: { day: number; выручка: number; ч
 
 /* =================== UI Components =================== */
 
-function KPICard({
-  icon,
-  title,
-  value,
-  subtitle,
-  color,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  value: string;
-  subtitle?: string;
-  color: string;
-}) {
+function KPICard({ icon, title, value, subtitle, color }: { icon: React.ReactNode; title: string; value: string; subtitle?: string; color: string }) {
   return (
     <div className="bg-white/5 backdrop-blur-xl rounded-2xl border border-white/10 p-5 hover:bg-white/[0.07] transition-all duration-300 group">
       <div className="flex items-start justify-between">
         <div>
           <p className="text-xs text-slate-400 mb-1">{title}</p>
-          <p className="text-2xl font-bold text-white group-hover:scale-105 transition-transform origin-left">
-            {value}
-          </p>
+          <p className="text-2xl font-bold text-white group-hover:scale-105 transition-transform origin-left">{value}</p>
           {subtitle && <p className="text-xs text-slate-500 mt-1">{subtitle}</p>}
         </div>
-        <div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${color} flex items-center justify-center text-white shadow-lg`}>
-          {icon}
-        </div>
+        <div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${color} flex items-center justify-center text-white shadow-lg`}>{icon}</div>
       </div>
     </div>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="h-[250px] flex items-center justify-center text-slate-500 text-sm">{text}</div>
   );
 }
